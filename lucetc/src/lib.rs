@@ -4,6 +4,7 @@ pub mod error;
 pub mod load;
 pub mod patch;
 pub mod program;
+pub mod new;
 
 use crate::compiler::function::compile_function;
 use crate::compiler::module_data::compile_module_data;
@@ -32,9 +33,6 @@ pub struct Lucetc {
     heap: HeapSettings,
     builtins_path: Option<PathBuf>,
 }
-
-/*
-*/
 
 impl Lucetc {
     pub fn new<P: AsRef<Path>>(input: P) -> Result<Self, LucetcError> {
