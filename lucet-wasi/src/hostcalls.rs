@@ -15,8 +15,13 @@ use crate::memory::*;
 use crate::{host, wasm32};
 use cast::From as _0;
 use lucet_runtime::vmctx::{lucet_vmctx, Vmctx};
+
+use nix::convert_ioctl_res;
+use nix::libc::c_int;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::prelude::{FromRawFd, OsStrExt, OsStringExt, RawFd};
+use std::time::SystemTime;
+use std::{cmp, slice};
 
 #[no_mangle]
 pub extern "C" fn __wasi_proc_exit(vmctx: *mut lucet_vmctx, rval: wasm32::__wasi_exitcode_t) -> ! {
@@ -978,6 +983,211 @@ pub extern "C" fn __wasi_random_get(
     thread_rng().fill_bytes(buf);
 
     return wasm32::__WASI_ESUCCESS;
+}
+
+nix::ioctl_read_bad!(fionread, nix::libc::FIONREAD, c_int);
+
+fn wasi_clock_to_relative_ns_delay(
+    wasi_clock: host::__wasi_subscription_t___wasi_subscription_u___wasi_subscription_u_clock_t,
+) -> u128 {
+    if wasi_clock.flags != wasm32::__WASI_SUBSCRIPTION_CLOCK_ABSTIME {
+        return wasi_clock.timeout as u128;
+    }
+    let now: u128 = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("Current date is before the epoch")
+        .as_nanos();
+    let deadline = wasi_clock.timeout as u128;
+    deadline.saturating_sub(now)
+}
+
+#[no_mangle]
+pub extern "C" fn __wasi_poll_oneoff(
+    vmctx: *mut lucet_vmctx,
+    input: wasm32::uintptr_t,
+    output: wasm32::uintptr_t,
+    nsubscriptions: wasm32::size_t,
+    nevents: wasm32::uintptr_t,
+) -> wasm32::__wasi_errno_t {
+    if nsubscriptions as u64 > wasm32::__wasi_filesize_t::max_value() {
+        return wasm32::__WASI_EINVAL;
+    }
+    let mut vmctx = unsafe { Vmctx::from_raw(vmctx) };
+    unsafe { enc_pointee(&mut vmctx, nevents, 0) }.unwrap();
+    let input_slice_ =
+        unsafe { dec_slice_of::<wasm32::__wasi_subscription_t>(&mut vmctx, input, nsubscriptions) }
+            .unwrap();
+    let input_slice = unsafe { slice::from_raw_parts(input_slice_.0, input_slice_.1) };
+
+    let output_slice_ =
+        unsafe { dec_slice_of::<wasm32::__wasi_event_t>(&mut vmctx, output, nsubscriptions) }
+            .unwrap();
+    let output_slice = unsafe { slice::from_raw_parts_mut(output_slice_.0, output_slice_.1) };
+
+    let input: Vec<_> = input_slice.iter().map(|x| dec_subscription(x)).collect();
+
+    let timeout = input
+        .iter()
+        .filter(|event| match event {
+            Ok(event) => event.type_ == wasm32::__WASI_EVENTTYPE_CLOCK,
+            _ => false,
+        })
+        .map(|event| {
+            let event = event.unwrap();
+            unsafe {
+                (
+                    wasi_clock_to_relative_ns_delay(event.u.clock) / 1_000_000,
+                    event.userdata,
+                )
+            }
+        })
+        .min_by_key(|event| event.0);
+    let fd_events: Vec<_> = input
+        .iter()
+        .filter(|event| match event {
+            Ok(event) => {
+                event.type_ == wasm32::__WASI_EVENTTYPE_FD_READ
+                    || event.type_ == wasm32::__WASI_EVENTTYPE_FD_WRITE
+            }
+            _ => false,
+        })
+        .map(|event| {
+            let event = event.unwrap();
+            (
+                unsafe { event.u.fd_readwrite.fd } as c_int,
+                event.type_,
+                event.userdata,
+            )
+        })
+        .collect();
+    if fd_events.is_empty() && timeout.is_none() {
+        return wasm32::__WASI_ESUCCESS;
+    }
+    let mut poll_fds: Vec<_> = fd_events
+        .iter()
+        .map(|event| {
+            let mut flags = nix::poll::EventFlags::empty();
+            match event.1 {
+                wasm32::__WASI_EVENTTYPE_FD_READ => flags.insert(nix::poll::EventFlags::POLLIN),
+                wasm32::__WASI_EVENTTYPE_FD_WRITE => flags.insert(nix::poll::EventFlags::POLLOUT),
+                _ => unreachable!(),
+            };
+            nix::poll::PollFd::new(event.0, flags)
+        })
+        .collect();
+    let timeout = timeout
+        .map(|(timeout, userdata)| (cmp::min(timeout, c_int::max_value() as u128), userdata));
+    let poll_timeout = timeout.map(|timeout| timeout.0 as c_int).unwrap_or(-1);
+    let ready = loop {
+        break {
+            match nix::poll::poll(&mut poll_fds, poll_timeout) {
+                Err(_) | Ok(-1) => {
+                    if nix::errno::Errno::last() == nix::errno::Errno::EINTR {
+                        continue;
+                    }
+                    return wasm32::errno_from_nix(nix::errno::Errno::last());
+                }
+                Ok(ready) => ready,
+            }
+        };
+    };
+    if ready == 0 {
+        if let Some((_, userdata)) = timeout {
+            let output_event = host::__wasi_event_t {
+                userdata,
+                type_: wasm32::__WASI_EVENTTYPE_CLOCK,
+                error: wasm32::__WASI_ESUCCESS,
+                u: host::__wasi_event_t___wasi_event_u {
+                    fd_readwrite:
+                        host::__wasi_event_t___wasi_event_u___wasi_event_u_fd_readwrite_t {
+                            nbytes: 0,
+                            flags: 0,
+                        },
+                },
+            };
+            output_slice[0] = enc_event(output_event);
+            unsafe { enc_slice_of(&mut vmctx, &output_slice[..1], output) }.unwrap();
+            unsafe { enc_pointee(&mut vmctx, nevents, 1) }.unwrap();
+        }
+        return wasm32::__WASI_ESUCCESS;
+    }
+    let mut fd_events_cur = fd_events.iter();
+    let mut poll_fds_cur = poll_fds.iter();
+    let mut output_slice_cur = output_slice.iter_mut();
+    let mut revents_count = 0;
+    for _ in 0..ready {
+        let fd_event = fd_events_cur.next().unwrap();
+        let poll_fd = poll_fds_cur.next().unwrap();
+        let revents = match poll_fd.revents() {
+            Some(revents) => revents,
+            None => continue,
+        };
+        let mut nbytes = 0;
+        if fd_event.1 == wasm32::__WASI_EVENTTYPE_FD_READ {
+            let _ = unsafe { fionread(fd_event.0, &mut nbytes) };
+        }
+        let output_event = if revents.contains(nix::poll::EventFlags::POLLNVAL) {
+            host::__wasi_event_t {
+                userdata: fd_event.2,
+                type_: fd_event.1,
+                error: wasm32::__WASI_EBADF,
+                u: host::__wasi_event_t___wasi_event_u {
+                    fd_readwrite:
+                        host::__wasi_event_t___wasi_event_u___wasi_event_u_fd_readwrite_t {
+                            nbytes: 0,
+                            flags: wasm32::__WASI_EVENT_FD_READWRITE_HANGUP,
+                        },
+                },
+            }
+        } else if revents.contains(nix::poll::EventFlags::POLLERR) {
+            host::__wasi_event_t {
+                userdata: fd_event.2,
+                type_: fd_event.1,
+                error: wasm32::__WASI_EIO,
+                u: host::__wasi_event_t___wasi_event_u {
+                    fd_readwrite:
+                        host::__wasi_event_t___wasi_event_u___wasi_event_u_fd_readwrite_t {
+                            nbytes: 0,
+                            flags: wasm32::__WASI_EVENT_FD_READWRITE_HANGUP,
+                        },
+                },
+            }
+        } else if revents.contains(nix::poll::EventFlags::POLLHUP) {
+            host::__wasi_event_t {
+                userdata: fd_event.2,
+                type_: fd_event.1,
+                error: wasm32::__WASI_ESUCCESS,
+                u: host::__wasi_event_t___wasi_event_u {
+                    fd_readwrite:
+                        host::__wasi_event_t___wasi_event_u___wasi_event_u_fd_readwrite_t {
+                            nbytes: 0,
+                            flags: wasm32::__WASI_EVENT_FD_READWRITE_HANGUP,
+                        },
+                },
+            }
+        } else if revents.contains(nix::poll::EventFlags::POLLIN)
+            | revents.contains(nix::poll::EventFlags::POLLOUT)
+        {
+            host::__wasi_event_t {
+                userdata: fd_event.2,
+                type_: fd_event.1,
+                error: wasm32::__WASI_ESUCCESS,
+                u: host::__wasi_event_t___wasi_event_u {
+                    fd_readwrite:
+                        host::__wasi_event_t___wasi_event_u___wasi_event_u_fd_readwrite_t {
+                            nbytes: nbytes as host::__wasi_filesize_t,
+                            flags: 0,
+                        },
+                },
+            }
+        } else {
+            continue;
+        };
+        *output_slice_cur.next().unwrap() = enc_event(output_event);
+        revents_count += 1;
+    }
+    unsafe { enc_pointee(&mut vmctx, nevents, revents_count) }.unwrap();
+    wasm32::__WASI_ESUCCESS
 }
 
 #[doc(hidden)]
