@@ -6,52 +6,33 @@ pub mod new;
 pub mod patch;
 pub mod program;
 
-use crate::compiler::function::compile_function;
-use crate::compiler::module_data::compile_module_data;
-use crate::compiler::table::compile_table;
-use crate::error::{LucetcError, LucetcErrorKind};
+use crate::error::LucetcError;
 use crate::load::read_module;
+use crate::new::Compiler;
 use crate::patch::patch_module;
-use crate::program::Program;
+pub use crate::{bindings::Bindings, compiler::OptLevel, program::memory::HeapSettings};
 use failure::{format_err, Error, ResultExt};
+use parity_wasm::elements::serialize;
 use parity_wasm::elements::Module;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tempfile;
-
-pub use crate::{
-    bindings::Bindings,
-    compiler::{Compiler, OptLevel},
-    program::memory::HeapSettings,
-};
 
 pub struct Lucetc {
     module: Module,
-    name: String,
     bindings: Bindings,
     opt_level: OptLevel,
     heap: HeapSettings,
-    builtins_path: Option<PathBuf>,
 }
 
 impl Lucetc {
     pub fn new<P: AsRef<Path>>(input: P) -> Result<Self, LucetcError> {
         let input = input.as_ref();
         let module = read_module(input)?;
-        let name = String::from(
-            input
-                .file_stem()
-                .ok_or(format_err!("input filename {:?} is not a file", input))?
-                .to_str()
-                .ok_or(format_err!("input filename {:?} is not valid utf8", input))?,
-        );
         Ok(Self {
             module,
-            name,
             bindings: Bindings::empty(),
             opt_level: OptLevel::default(),
             heap: HeapSettings::default(),
-            builtins_path: None,
         })
     }
 
@@ -99,40 +80,22 @@ impl Lucetc {
     }
 
     pub fn object_file<P: AsRef<Path>>(self, output: P) -> Result<(), Error> {
-        use new::compile;
-        use parity_wasm::elements::serialize;
         let module_contents = serialize(self.module)?;
 
-        let obj = compile(&module_contents, self.opt_level, &self.bindings, self.heap)?;
+        let compiler = Compiler::new(&module_contents, self.opt_level, &self.bindings, self.heap)?;
+        let obj = compiler.object_file()?;
 
         obj.write(output.as_ref()).context("writing object file")?;
         Ok(())
     }
-    /*
-        pub fn object_file<P: AsRef<Path>>(self, output: P) -> Result<(), Error> {
-            let prog = Program::new(self.module, self.bindings, self.heap.clone())?;
-            let comp = compile(&prog, &self.name, self.opt_level)?;
 
-            let obj = comp.codegen()?;
-            obj.write(output.as_ref()).context("writing object file")?;
-
-            Ok(())
-        }
-    */
     pub fn clif_ir<P: AsRef<Path>>(self, output: P) -> Result<(), Error> {
-        let (module, builtins_map) = if let Some(ref builtins_path) = self.builtins_path {
-            patch_module(self.module, builtins_path)?
-        } else {
-            (self.module, HashMap::new())
-        };
+        let module_contents = serialize(self.module)?;
 
-        let mut bindings = self.bindings.clone();
-        bindings.extend(Bindings::env(builtins_map))?;
+        let compiler = Compiler::new(&module_contents, self.opt_level, &self.bindings, self.heap)?;
 
-        let prog = Program::new(module, bindings, self.heap.clone())?;
-        let comp = compile(&prog, &self.name, self.opt_level)?;
-
-        comp.cranelift_funcs()
+        compiler
+            .cranelift_funcs()?
             .write(&output)
             .context("writing clif file")?;
 
@@ -172,26 +135,4 @@ where
         ))?;
     }
     Ok(())
-}
-
-pub fn compile<'p>(
-    program: &'p Program,
-    name: &str,
-    opt_level: OptLevel,
-) -> Result<Compiler<'p>, LucetcError> {
-    let mut compiler = Compiler::new(name.to_owned(), &program, opt_level)?;
-
-    compile_module_data(&mut compiler).context(LucetcErrorKind::ModuleData)?;
-
-    for function in program.defined_functions() {
-        let body = program.function_body(&function);
-        compile_function(&mut compiler, &function, body)
-            .context(LucetcErrorKind::Function(function.symbol().to_owned()))?;
-    }
-    for table in program.tables() {
-        compile_table(&mut compiler, &table)
-            .context(LucetcErrorKind::Table(table.symbol().to_owned()))?;
-    }
-
-    Ok(compiler)
 }
