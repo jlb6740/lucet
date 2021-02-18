@@ -260,14 +260,24 @@ fn run(config: Config<'_>) {
 
         match inst.run(config.entrypoint, &[]) {
             // normal termination implies 0 exit code
-            Ok(RunResult::Returned(_)) => 0,
+            Ok(RunResult::Returned(_)) => {
+                let instruction_count = inst.get_instruction_count();
+                   if instruction_count.is_some() {
+                           println!("Instruction Counts: {:?}", instruction_count.unwrap());
+                }
+                0},
             // none of the WASI hostcalls use yield yet, so this shouldn't happen
             Ok(RunResult::Yielded(_)) => panic!("lucet-wasi unexpectedly yielded"),
             Err(lucet_runtime::Error::RuntimeTerminated(
                 lucet_runtime::TerminationDetails::Provided(any),
-            )) => *any
+            )) => {
+                let instruction_count = inst.get_instruction_count();
+                   if instruction_count.is_some() {
+                           println!("Instruction Counts: {:?}", instruction_count.unwrap());
+                }
+            *any
                 .downcast_ref::<Exitcode>()
-                .expect("termination yields an exitcode"),
+                .expect("termination yields an exitcode") },
             Err(lucet_runtime::Error::RuntimeTerminated(
                 lucet_runtime::TerminationDetails::Remote,
             )) => {
