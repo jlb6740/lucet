@@ -260,7 +260,13 @@ fn run(config: Config<'_>) {
 
         match inst.run(config.entrypoint, &[]) {
             // normal termination implies 0 exit code
-            Ok(RunResult::Returned(_)) => 0,
+            Ok(RunResult::Returned(_)) => {
+                let instruction_count = inst.get_instruction_count();
+                if instruction_count.is_some() {
+                    println!("Instruction Counts: {:?}", instruction_count.unwrap());
+                }
+                0
+            },
             // none of the WASI hostcalls use yield yet, so this shouldn't happen
             Ok(RunResult::Yielded(_)) => panic!("lucet-wasi unexpectedly yielded"),
             Err(lucet_runtime::Error::RuntimeTerminated(
@@ -269,9 +275,14 @@ fn run(config: Config<'_>) {
                 println!("Terminated via remote kill switch (likely a timeout)");
                 std::u32::MAX
             }
-            Err(lucet_runtime::Error::RuntimeTerminated(details)) => details
+            Err(lucet_runtime::Error::RuntimeTerminated(details)) => {
+            let instruction_count = inst.get_instruction_count();
+            if instruction_count.is_some() {
+                println!("Instruction Counts: {:?}", instruction_count.unwrap());
+            }
+            details
                 .as_exitcode()
-                .expect("termination yields an exitcode"),
+                .expect("termination yields an exitcode")},
             Err(e) => panic!("lucet-wasi runtime error: {}", e),
         }
     };
